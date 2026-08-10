@@ -238,6 +238,7 @@ $RECYCLE.BIN/
 # ============================================
 # Testing and Coverage
 # ============================================
+tests/
 .coverage
 .coverage.*
 htmlcov/

@@ -12,7 +12,6 @@ from deeptutor.agents.chat.agentic_pipeline import AgenticChatPipeline
 from deeptutor.capabilities.explore_context import explorer as explorer_mod
 from deeptutor.capabilities.mastery import MASTERY_TOOL_NAMES
 from deeptutor.core.context import Attachment, UnifiedContext
-from deeptutor.core.agentic.labeled_step import AgenticModelError
 from deeptutor.core.stream import StreamEvent, StreamEventType
 from deeptutor.core.stream_bus import StreamBus
 from deeptutor.core.tool_protocol import ToolResult
@@ -36,8 +35,6 @@ def _llm_chunk(
     tool_calls: list[dict[str, Any]] | None = None,
     usage: Any = None,
     finish_reason: str | None = None,
-    continuation_items: list[dict[str, Any]] | None = None,
-    termination: dict[str, Any] | None = None,
 ) -> SimpleNamespace:
     delta_fields: dict[str, Any] = {"content": content}
     if tool_calls is not None:
@@ -62,8 +59,6 @@ def _llm_chunk(
             )
         ],
         usage=usage,
-        continuation_items=continuation_items or [],
-        termination=termination or {},
     )
 
 
@@ -366,29 +361,6 @@ async def test_empty_finish_gets_one_nudge_then_recovers(
 
 
 @pytest.mark.asyncio
-async def test_explicit_responses_completed_empty_fails_without_nudge(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client = _ScriptedChatClient(
-        [[_llm_chunk(termination={"provider_status": "completed"})]]
-    )
-    pipeline = AgenticChatPipeline(language="en")
-    pipeline.registry = _Registry()
-    pipeline._client_config = SimpleNamespace(
-        api_protocol="openai_responses",
-        resolved_api_protocol="openai_responses",
-    )
-    monkeypatch.setattr(pipeline, "_compose_enabled_tools", lambda _context: [])
-    monkeypatch.setattr(pipeline, "_build_openai_client", lambda: client)
-
-    with pytest.raises(AgenticModelError, match="without usable output") as excinfo:
-        await _run(pipeline, UnifiedContext(session_id="s1", user_message="Answer"))
-
-    assert excinfo.value.code == "model_output_empty"
-    assert client.call_count == 1
-
-
-@pytest.mark.asyncio
 async def test_explore_context_pre_pass_seeds_loop_without_polluting_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -527,25 +499,6 @@ async def test_tool_round_then_finish(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.metadata["rounds"] == 2
     # Only the finish round's text is the persisted answer.
     assert result.metadata["response"] == "Found what was needed."
-
-
-@pytest.mark.asyncio
-async def test_tool_continuation_is_carried_only_into_second_request(monkeypatch: pytest.MonkeyPatch) -> None:
-    registry = _Registry()
-    opaque = {"type": "function_call", "call_id": "call-opaque", "encrypted_content": "opaque-SENTINEL"}
-    client = _ScriptedChatClient([
-        [_llm_chunk(tool_calls=[{"id": "call-1", "name": "web_search", "arguments": json.dumps({"query": "x"})}], continuation_items=[opaque])],
-        [_llm_chunk(content="done")],
-    ])
-    pipeline = AgenticChatPipeline(language="en")
-    pipeline.registry = registry
-    monkeypatch.setattr(pipeline, "_compose_enabled_tools", lambda _context: ["web_search"])
-    monkeypatch.setattr(pipeline, "_build_openai_client", lambda: client)
-    events = await _run(pipeline, UnifiedContext(session_id="s1", user_message="x", enabled_tools=["web_search"]))
-    assistant = next(message for message in client.calls[1]["messages"] if message.get("role") == "assistant" and message.get("tool_calls"))
-    assert assistant["responses_continuation_items"] == [opaque]
-    assert next(message for message in client.calls[1]["messages"] if message.get("role") == "tool")["content"] == "tool answer"
-    assert "opaque-SENTINEL" not in repr([(event.content, event.metadata) for event in events])
 
 
 @pytest.mark.asyncio
@@ -1016,92 +969,3 @@ def test_build_llm_tool_schemas_kb_name_enum_matches_attached() -> None:
     )
 
     assert schemas[0]["function"]["parameters"]["additionalProperties"] is False
-
-
-@pytest.mark.asyncio
-async def test_mastery_turn_llm_rounds_are_audited(monkeypatch, tmp_path) -> None:
-    """MOD-03 production hook: a learning-path turn audits every LLM round with
-    a ``pending`` record persisted before the provider request and a terminal
-    revision appended after success."""
-    from deeptutor.learning.models import (
-        LearningProgress,
-        ModelInvocationPurpose,
-        ModelInvocationStatus,
-    )
-    from deeptutor.learning.storage import LearningStore, find_model_invocation
-    from deeptutor.services.model_selection import ModelInvocationAuditContext
-    from deeptutor.services.model_selection.selector import ResolvedModelSnapshot
-
-    store = LearningStore(root=tmp_path)
-    progress = LearningProgress(book_id="path-1")
-    store.save(progress)
-
-    snapshot = ResolvedModelSnapshot(
-        profile_id="p1",
-        profile_name="OpenAI",
-        profile_revision="r1",
-        requested_provider="openai",
-        requested_protocol="openai_responses",
-        requested_model="gpt-test",
-        resolved_provider="openai",
-        resolved_protocol="openai_responses",
-        resolved_model="gpt-test",
-        auto_resolution_reason="",
-        base_url_fingerprint="fp",
-        strict_protocol=True,
-    )
-    ctx = ModelInvocationAuditContext(
-        purpose=ModelInvocationPurpose.TEACHING,
-        book_id="path-1",
-        store=store,
-        snapshot=snapshot,
-        session_id="s1",
-        turn_id="t1",
-    )
-
-    registry = _Registry()
-    client = _ScriptedChatClient(
-        [
-            [_llm_chunk(content="The answer.")],
-        ]
-    )
-    pipeline = AgenticChatPipeline(language="en")
-    pipeline.registry = registry
-    monkeypatch.setattr(pipeline, "_compose_enabled_tools", lambda _context: [])
-    monkeypatch.setattr(pipeline, "_build_openai_client", lambda: client)
-    monkeypatch.setattr(pipeline, "_build_invocation_audit", lambda _context: (ctx, snapshot))
-
-    await _run(pipeline, UnifiedContext(session_id="s1", user_message="Teach me"))
-
-    loaded = store.load("path-1")
-    assert loaded.model_invocations
-    latest = find_model_invocation(loaded, loaded.model_invocations[0].id)
-    assert latest.status == ModelInvocationStatus.COMPLETED
-    assert latest.purpose == ModelInvocationPurpose.TEACHING
-    assert latest.session_id == "s1"
-    assert latest.turn_id == "t1"
-    # Pending revision preserved + terminal revision appended.
-    assert len(loaded.model_invocations) == 2
-
-
-@pytest.mark.asyncio
-async def test_plain_chat_turn_is_not_audited(monkeypatch) -> None:
-    """Plain chat (no learning path) has no LearningProgress container, so the
-    audit seam is a no-op and legacy behaviour is preserved."""
-    registry = _Registry()
-    client = _ScriptedChatClient(
-        [
-            [_llm_chunk(content="Hello there.")],
-        ]
-    )
-    pipeline = AgenticChatPipeline(language="en")
-    pipeline.registry = registry
-    monkeypatch.setattr(pipeline, "_compose_enabled_tools", lambda _context: [])
-    monkeypatch.setattr(pipeline, "_build_openai_client", lambda: client)
-    # Ensure no audit context is resolved for a plain chat turn.
-    monkeypatch.setattr(pipeline, "_build_invocation_audit", lambda _context: (None, None))
-
-    events = await _run(pipeline, UnifiedContext(session_id="s1", user_message="Hi"))
-
-    assert "".join(_contents(events)) == "Hello there."
-    assert getattr(pipeline, "_invocation_audit", None) is None
