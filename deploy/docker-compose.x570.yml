@@ -1,0 +1,28 @@
+# DeepTutor — x570 Docker Compose deployment manifest (issue #5 migration)
+#
+# Previously run on the x570 host as a standalone container started manually
+# (restart=no). This manifest wraps the same locally-built reviewed image and
+# reuses the existing `deeptutor-data` volume, preserving the LAN entry points:
+#   - UI   192.168.88.75:3782
+#   - API  192.168.88.75:8001
+# `restart: unless-stopped` restores the service after host reboot.
+#
+# Management:
+#   cd deploy  && docker compose up -d     # start
+#   cd deploy  && docker compose down      # stop (data volume untouched)
+services:
+  deeptutor:
+    image: deeptutor:32d8ec3a9c91a5e5076acd0bc8e5c6b64b6ca344
+    container_name: deeptutor
+    pull_policy: never
+    restart: unless-stopped
+    ports:
+      - "192.168.88.75:3782:3782"
+      - "192.168.88.75:8001:8001"
+    volumes:
+      - deeptutor-data:/app/data
+
+volumes:
+  deeptutor-data:
+    external: true
+    name: deeptutor-data
